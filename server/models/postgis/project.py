@@ -1,12 +1,10 @@
 import json
-import re
 from typing import Optional
 from cachetools import TTLCache, cached
 
 import geojson
 from flask import current_app
 from geoalchemy2 import Geometry
-from shapely.geometry import shape
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm.session import make_transient
 from geoalchemy2.shape import to_shape
@@ -62,7 +60,6 @@ class Project(db.Model):
     private = db.Column(db.Boolean, default=False)  # Only allowed users can validate
     entities_to_map = db.Column(db.String)
     changeset_comment = db.Column(db.String)
-    osmcha_filter_id = db.Column(db.String)  # Optional custom filter id for filtering on OSMCha
     due_date = db.Column(db.DateTime)
     imagery = db.Column(db.String)
     josm_preset = db.Column(db.String)
@@ -241,13 +238,6 @@ class Project(db.Model):
         self.last_updated = timestamp()
         self.license_id = project_dto.license_id
 
-        if project_dto.osmcha_filter_id:
-            # Support simple extraction of OSMCha filter id from OSMCha URL
-            match = re.search('aoi=([\w-]+)', project_dto.osmcha_filter_id)
-            self.osmcha_filter_id = match.group(1) if match else project_dto.osmcha_filter_id
-        else:
-            self.osmcha_filter_id = None
-
         if project_dto.organisation_tag:
             org_tag = Tags.upsert_organistion_tag(project_dto.organisation_tag)
             self.organisation_tag = org_tag
@@ -345,8 +335,12 @@ class Project(db.Model):
 
         admin_projects_dto = PMDashboardDTO()
         for project in admins_projects:
-            pm_project = project.get_project_summary(preferred_locale)
+            # print('project: ', project.id)
+            pm_project = project.as_dto_for_admin(project.id)
+            # pm_project = project.get_project_summary(preferred_locale)
             project_status = ProjectStatus(project.status)
+            # print(project)
+            # print(pm_project)
 
             if project_status == ProjectStatus.DRAFT:
                 admin_projects_dto.draft_projects.append(pm_project)
@@ -404,8 +398,8 @@ class Project(db.Model):
                 TaskHistory.action == 'LOCKED_FOR_VALIDATION',
                 TaskHistory.project_id == self.id
             ).distinct(TaskHistory.user_id).count()
-        current_app.logger.debug(unique_mappers)
-        current_app.logger.debug(unique_validators)
+        # current_app.logger.debug(unique_mappers)
+        # current_app.logger.debug(unique_validators)
         summary.total_tasks = self.total_tasks
         summary.total_comments = db.session.query(ProjectChat).filter(ProjectChat.project_id == self.id).count()
 
@@ -420,46 +414,66 @@ class Project(db.Model):
         project_info = ProjectInfo.get_dto_for_locale(self.id, preferred_locale, self.default_locale)
         summary.name = project_info.name
         summary.short_description = project_info.short_description
+        sql = '''SELECT SUM(TO_TIMESTAMP(action_text, 'HH24:MI:SS')::TIME) FROM task_history WHERE action='LOCKED_FOR_MAPPING';'''
+        value_mapping = db.engine.execute(sql)
+        for value in value_mapping:
+            current_app.logger.debug(value[0])
+
+        sql= '''SELECT SUM(TO_TIMESTAMP(action_text, 'HH24:MI:SS')::TIME) FROM task_history WHERE action='LOCKED_FOR_VALIDATION';'''
+        value_validation = db.engine.execute(sql)
+        for another_value in value_validation:
+            current_app.logger.debug(another_value[0])
+
+
 
         users_durations = TaskHistory.query.filter(
                 TaskHistory.action_text != '',
                 TaskHistory.project_id == self.id
             ).all()
-
-        total_mapping_time = 0
-        total_validation_time = 0
-        total_time_spent = 0
-
+        total_mapping_time = datetime.datetime.min
+        total_validation_time = datetime.datetime.min
+        total_time_spent = datetime.datetime.min
         for user_duration in users_durations:
             try:
                 duration = dateutil.parser.parse(user_duration.action_text)
                 total_time_spent += datetime.timedelta(hours=duration.hour,
-                                         minutes=duration.minute,
-                                         seconds=duration.second,
-                                         microseconds=duration.microsecond).total_seconds()
+                                                    minutes=duration.minute,
+                                                    seconds=duration.second,
+                                                    microseconds=duration.microsecond)
                 if user_duration.action == 'LOCKED_FOR_MAPPING':
                     total_mapping_time += datetime.timedelta(hours=duration.hour,
-                                             minutes=duration.minute,
-                                             seconds=duration.second,
-                                             microseconds=duration.microsecond).total_seconds()
+                                                    minutes=duration.minute,
+                                                    seconds=duration.second,
+                                                    microseconds=duration.microsecond)
                 elif user_duration.action == 'LOCKED_FOR_VALIDATION':
                     total_validation_time += datetime.timedelta(hours=duration.hour,
-                                             minutes=duration.minute,
-                                             seconds=duration.second,
-                                             microseconds=duration.microsecond).total_seconds()
+                                                    minutes=duration.minute,
+                                                    seconds=duration.second,
+                                                    microseconds=duration.microsecond)
             except ValueError:
                 pass
+            #     current_app.logger.info('Invalid duration specified')
+            # current_app.logger.debug(total_mapping_time)
+            # current_app.logger.debug(total_validation_time)
+            total_mapping_seconds = int(datetime.timedelta(hours=total_mapping_time.hour,
+                                                    minutes=total_mapping_time.minute,
+                                                    seconds=total_mapping_time.second,
+                                                    microseconds=total_mapping_time.microsecond).total_seconds())
+            total_validation_seconds = int(datetime.timedelta(hours=total_validation_time.hour,
+                                                    minutes=total_validation_time.minute,
+                                                    seconds=total_validation_time.second,
+                                                    microseconds=total_validation_time.microsecond).total_seconds())
+            if unique_mappers:
+                average_mapping_time = total_mapping_seconds/unique_mappers
+                summary.average_mapping_time = str(datetime.timedelta(seconds=average_mapping_time))
+            if unique_validators:
+                average_validation_time = total_validation_seconds/unique_validators
+                summary.average_validation_time = str(datetime.timedelta(seconds=average_validation_time))
 
-        if unique_mappers:
-            average_mapping_time = total_mapping_time/unique_mappers
-            summary.average_mapping_time = average_mapping_time
-        if unique_validators:
-            average_validation_time = total_validation_time/unique_validators
-            summary.average_validation_time = average_validation_time
+            summary.total_mapping_time = total_mapping_time.time().isoformat()
+            summary.total_validation_time = total_validation_time.time().isoformat()
+            summary.total_time_spent = total_time_spent.time().isoformat()
 
-        summary.total_mapping_time = total_mapping_time
-        summary.total_validation_time = total_validation_time
-        summary.total_time_spent = total_time_spent
 
         return summary
 
@@ -491,8 +505,9 @@ class Project(db.Model):
         base_dto.project_status = ProjectStatus(self.status).name
         base_dto.default_locale = self.default_locale
         base_dto.project_priority = ProjectPriority(self.priority).name
+        centroid_geojson = db.session.scalar(self.centroid.ST_AsGeoJSON())
+        base_dto.aoi_centroid = geojson.loads(centroid_geojson)
         base_dto.area_of_interest = self.get_aoi_geometry_as_geojson()
-        base_dto.aoi_bbox = shape(base_dto.area_of_interest).bounds
         base_dto.enforce_mapper_level = self.enforce_mapper_level
         base_dto.enforce_validator_role = self.enforce_validator_role
         base_dto.allow_non_beginners = self.allow_non_beginners
@@ -500,7 +515,6 @@ class Project(db.Model):
         base_dto.mapper_level = MappingLevel(self.mapper_level).name
         base_dto.entities_to_map = self.entities_to_map
         base_dto.changeset_comment = self.changeset_comment
-        base_dto.osmcha_filter_id = self.osmcha_filter_id
         base_dto.due_date = self.due_date
         base_dto.imagery = self.imagery
         base_dto.josm_preset = self.josm_preset
