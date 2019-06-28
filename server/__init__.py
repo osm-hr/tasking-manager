@@ -10,6 +10,15 @@ from flask_oauthlib.client import OAuth
 from flask_restful import Api
 from flask_sqlalchemy import SQLAlchemy
 
+from .config import EnvironmentConfig
+
+
+if EnvironmentConfig.SENTRY_DSN:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+
+    sentry_sdk.init(dsn=EnvironmentConfig.SENTRY_DSN, integrations=[FlaskIntegration()])
+
 db = SQLAlchemy()
 migrate = Migrate()
 oauth = OAuth()
